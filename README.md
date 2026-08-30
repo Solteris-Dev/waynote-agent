@@ -137,3 +137,7 @@ Passed via `--append-system-prompt`. For agents without such a flag, use
 - Per-note system prompt via a frontmatter key (waynote passes unknown keys through)
 - Stream the reply in progressively instead of one write
 - Different trigger per tag (`tags: [agent, shell]`)
+
+## License
+
+Apache-2.0. See `LICENSE` and `NOTICE`.
