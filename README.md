@@ -29,7 +29,7 @@ The trigger is replaced in place, so it can never fire twice:
 ```
 > **?** what port does the terraria server use?
 
-198.51.100.7
+7777 by default.
 ```
 
 Untagged notes are ignored entirely.
@@ -134,9 +134,8 @@ Passed via `--append-system-prompt`. For agents without such a flag, use
 
 ## Ideas
 
-- Per-note system prompt via a frontmatter key (waynote passes unknown keys through)
-- Stream the reply in progressively instead of one write
-- Different trigger per tag (`tags: [agent, shell]`)
+- A different trigger per tag (`tags: [agent, shell]`)
+- Answer several pending triggers in one pass rather than one per poll
 
 ## License
 
