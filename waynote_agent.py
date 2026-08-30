@@ -38,7 +38,11 @@ from pathlib import Path
 DEFAULT_NOTES_DIR = Path.home() / ".local/share/waynote/notes"
 DEFAULT_AGENT = "claude -p --output-format stream-json --include-partial-messages --verbose"
 AGENT_TAG = "agent"
+# `!question` continues the thread; `!!question` starts fresh. Continuation is
+# the default because the alternative — re-establishing context every line — is
+# the easy behaviour, not the useful one.
 TRIGGER = re.compile(r"^!\s*(\S.*)$")
+RESET_TRIGGER = re.compile(r"^!!\s*(\S.*)$")
 # Written in place of the trigger while the agent runs, so you get feedback on
 # screen immediately and the line can never fire twice.
 PENDING = "_…thinking…_"
@@ -46,6 +50,19 @@ CARET = "▌"
 STREAM_INTERVAL = 0.35  # seconds between note rewrites while streaming
 SETTLE_SECONDS = 1.5    # ignore a file still being typed into
 POLL_SECONDS = 0.5
+DEFAULT_CONTEXT_CHARS = 6000
+
+CONTEXT_TEMPLATE = """\
+You are answering inside a live sticky note on the user's desktop. The note so \
+far is below. Lines beginning `> **?**` are the user's earlier questions; the \
+text after each one is your own earlier answer. Treat it as an ongoing thread \
+and resolve references like "it" or "this" against it.
+
+--- note so far ---
+{context}
+--- end of note ---
+
+{question}"""
 
 
 def _state_dir() -> Path:
@@ -96,6 +113,21 @@ note itself:
 
 ```
 system: you are a terse sysadmin; answer in one line
+```
+
+## Threads
+
+The note is the conversation. Everything above your question gets sent as
+context, so follow-ups work — "what about the other one?" resolves against what
+is already written here.
+
+Because the context *is* this note, you steer it by editing: delete an answer
+you didn't like and it stops influencing the thread.
+
+To ask something unrelated without dragging the thread along, use two bangs:
+
+```
+!!a completely fresh question
 ```
 
 ## Notes
@@ -257,7 +289,7 @@ def write_atomic(path: Path, text: str) -> None:
 
 
 def process(path: Path, cmd: list[str], timeout: int, system_flag: str,
-            streaming: bool) -> bool:
+            streaming: bool, context_chars: int) -> bool:
     """Answer the first pending trigger in `path`. True if the file changed."""
     text = path.read_text()
     fm, body = split_frontmatter(text)
@@ -274,10 +306,25 @@ def process(path: Path, cmd: list[str], timeout: int, system_flag: str,
             continue
         if in_fence:
             continue
-        m = TRIGGER.match(line)
+        reset = RESET_TRIGGER.match(line)
+        m = reset or TRIGGER.match(line)
         if not m:
             continue
         question = m.group(1).strip()
+
+        # The note above the trigger *is* the conversation history. Using it
+        # directly — rather than a hidden session id — means the context is the
+        # thing on screen: edit the note and you have edited what the agent
+        # sees, delete a bad exchange and it stops poisoning the thread.
+        context = ""
+        if context_chars > 0 and not reset:
+            prior = "\n".join(lines[:i]).strip()
+            if len(prior) > context_chars:      # keep the tail; recent > old
+                prior = prior[-context_chars:]
+                prior = prior[prior.find("\n") + 1 :]  # drop the half-line
+            context = prior
+        prompt = (CONTEXT_TEMPLATE.format(context=context, question=question)
+                  if context else question)
 
         # 1) claim the line immediately so it cannot re-fire, and so the note
         #    shows a marker while the agent thinks.
@@ -298,7 +345,7 @@ def process(path: Path, cmd: list[str], timeout: int, system_flag: str,
             write_atomic(path, fm_now + body_now.replace(prev, nxt, 1))
             prev = nxt
 
-        argv = build_argv(cmd, question, read_system_prompt(fm), system_flag)
+        argv = build_argv(cmd, prompt, read_system_prompt(fm), system_flag)
         answer = (ask_streaming(argv, timeout, on_partial) if streaming
                   else ask_once(argv, timeout))
 
@@ -326,6 +373,10 @@ def main() -> int:
                          "--append-system-prompt)")
     ap.add_argument("--no-stream", action="store_true",
                     help="disable progressive writing even if the agent supports it")
+    ap.add_argument("--context-chars", type=int, default=DEFAULT_CONTEXT_CHARS,
+                    help="how much of the note above the trigger to send as "
+                         "conversation context; 0 disables (default: "
+                         f"{DEFAULT_CONTEXT_CHARS})")
     ap.add_argument("--no-seed", action="store_true",
                     help="skip the one-time explainer note")
     ap.add_argument("--once", action="store_true", help="one pass, then exit")
@@ -359,7 +410,8 @@ def main() -> int:
             if time.time() - mtime < SETTLE_SECONDS or seen.get(path) == mtime:
                 continue
             try:
-                if process(path, cmd, args.timeout, args.system_flag, streaming):
+                if process(path, cmd, args.timeout, args.system_flag,
+                           streaming, args.context_chars):
                     print(f"answered a trigger in {path.name}", flush=True)
             except Exception as e:  # a bad note must not kill the daemon
                 print(f"error on {path.name}: {e}", file=sys.stderr, flush=True)

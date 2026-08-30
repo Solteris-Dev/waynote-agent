@@ -34,6 +34,23 @@ The trigger is replaced in place, so it can never fire twice:
 
 Untagged notes are ignored entirely.
 
+## Threads
+
+The note *is* the conversation. Everything above the trigger is sent as context,
+so follow-ups resolve — "which of those would you fix first?" works.
+
+Two bangs start fresh, dragging nothing along:
+
+```
+!!an unrelated question
+```
+
+Because the context is the note rather than a hidden session id, you steer it by
+editing: delete an answer you didn't like and it stops influencing the thread.
+That also means there is no session to expire and nothing to get out of sync
+with what's on screen. Context is capped by `--context-chars` (default 6000,
+tail-biased); `--context-chars 0` restores one-shot behaviour.
+
 ## Run
 
 ```sh
