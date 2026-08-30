@@ -1,0 +1,13 @@
+[Unit]
+Description=waynote-agent — answer !-lines inside waynote notes
+# No [Install]/graphical-session.target: that target is inactive in this
+# session, so the unit is started from hyprland.lua like waybar.service is.
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+ExecStart=%h/Repos/waynote-agent/waynote_agent.py
+# `claude` lives in ~/.local/bin, which is not on the default user-unit PATH.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=2
