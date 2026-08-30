@@ -97,13 +97,31 @@ Try deleting the fence below and asking something, or just type your own line.
 !what does wlr-layer-shell do?
 ```
 
-## Turning it on elsewhere
+## Making another one
 
-Any note works — add `agent` to its tags in the frontmatter:
+```
+waynote_agent.py --new "title"
+```
+
+Or bind it: Super+N makes a plain note, Super+Shift+N an agentic one.
+Any existing note works too — add `agent` to its tags:
 
 ```
 tags: [agent]
 ```
+
+## Privacy
+
+By default the agent runs in an empty scratch directory, so a sticky note
+cannot read your Claude Code memory or CLAUDE.md. To let one note see your
+personal context, add:
+
+```
+personal: true
+```
+
+That is what lets it answer questions about your own machine and notes — which
+is useful for a scratchpad and wrong for a shopping list, so it is per note.
 
 ## Giving a note its own persona
 
@@ -137,6 +155,30 @@ To ask something unrelated without dragging the thread along, use two bangs:
   it can never fire twice.
 - Delete this note freely — it is seeded once and never comes back.
 """
+
+
+def create_note(notes_dir: Path, body: str, color: str = "yellow",
+                personal: bool = False) -> Path:
+    """Write a new agent-enabled note and return its path."""
+    note_id = new_ulid()
+    slug = re.sub(r"[^a-z0-9]+", "-",
+                  (body.strip().splitlines() or ["untitled"])[0].lstrip("# ").lower()
+                  ).strip("-")[:40] or "untitled"
+    path = notes_dir / f"{note_id}-{slug}.md"
+    frontmatter = (
+        "---\n"
+        f"id: {note_id}\n"
+        f"color: {color}\n"
+        "pinned: false\n"
+        "locked: false\n"
+        "layer: front\n"
+        "tags: [agent]\n"
+        + ("personal: true\n" if personal else "")
+        + "---\n"
+    )
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    write_atomic(path, frontmatter + body)
+    return path
 
 
 def seed_welcome(notes_dir: Path) -> Path | None:
@@ -189,6 +231,18 @@ def has_agent_tag(frontmatter: str) -> bool:
     return False
 
 
+def wants_personal_context(frontmatter: str) -> bool:
+    """`personal: true` opts a note into your Claude Code memory and CLAUDE.md.
+
+    Claude Code keys memory by working directory, so this is off by default:
+    the agent runs in a neutral scratch dir and sees nothing about you. Opting
+    in runs it from $HOME instead, which is what makes answers able to cite
+    your own notes — and what you probably don't want every sticky doing.
+    """
+    m = re.search(r"^personal:\s*(.+?)\s*$", frontmatter, re.M)
+    return bool(m) and m.group(1).strip().strip("\"'").lower() in {"true", "yes", "1", "on"}
+
+
 def read_system_prompt(frontmatter: str) -> str | None:
     """A per-note persona: `system: ...` (quoted or bare) in the frontmatter.
 
@@ -231,9 +285,10 @@ def unwrap(out: str) -> str:
     return out or "_(empty reply)_"
 
 
-def ask_once(argv: list[str], timeout: int) -> str:
+def ask_once(argv: list[str], timeout: int, cwd: Path) -> str:
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(argv, capture_output=True, text=True,
+                           timeout=timeout, cwd=cwd)
     except subprocess.TimeoutExpired:
         return f"_(agent timed out after {timeout}s)_"
     out = (r.stdout or "").strip()
@@ -242,10 +297,10 @@ def ask_once(argv: list[str], timeout: int) -> str:
     return unwrap(out)
 
 
-def ask_streaming(argv: list[str], timeout: int, on_partial) -> str:
+def ask_streaming(argv: list[str], timeout: int, on_partial, cwd: Path) -> str:
     """Run an agent that speaks stream-json, feeding partial text to on_partial."""
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, bufsize=1)
+                            text=True, bufsize=1, cwd=cwd)
     acc, final, last = "", None, 0.0
     deadline = time.time() + timeout
     try:
@@ -289,7 +344,7 @@ def write_atomic(path: Path, text: str) -> None:
 
 
 def process(path: Path, cmd: list[str], timeout: int, system_flag: str,
-            streaming: bool, context_chars: int) -> bool:
+            streaming: bool, context_chars: int, workdir: Path) -> bool:
     """Answer the first pending trigger in `path`. True if the file changed."""
     text = path.read_text()
     fm, body = split_frontmatter(text)
@@ -346,8 +401,9 @@ def process(path: Path, cmd: list[str], timeout: int, system_flag: str,
             prev = nxt
 
         argv = build_argv(cmd, prompt, read_system_prompt(fm), system_flag)
-        answer = (ask_streaming(argv, timeout, on_partial) if streaming
-                  else ask_once(argv, timeout))
+        cwd = Path.home() if wants_personal_context(fm) else workdir
+        answer = (ask_streaming(argv, timeout, on_partial, cwd) if streaming
+                  else ask_once(argv, timeout, cwd))
 
         # 2) swap whatever is on screen for the final answer.
         cur = path.read_text()
@@ -377,10 +433,33 @@ def main() -> int:
                     help="how much of the note above the trigger to send as "
                          "conversation context; 0 disables (default: "
                          f"{DEFAULT_CONTEXT_CHARS})")
+    ap.add_argument("--workdir", type=Path, default=None,
+                    help="directory the agent runs in. Claude Code keys memory "
+                         "and CLAUDE.md by cwd, so the default is a neutral "
+                         "scratch dir: notes see nothing personal unless the "
+                         "note opts in with `personal: true`")
+    ap.add_argument("--new", nargs="?", const="", metavar="TITLE",
+                    help="create an agent-enabled note and exit")
+    ap.add_argument("--personal", action="store_true",
+                    help="with --new: also set `personal: true` on the note")
     ap.add_argument("--no-seed", action="store_true",
                     help="skip the one-time explainer note")
     ap.add_argument("--once", action="store_true", help="one pass, then exit")
     args = ap.parse_args()
+
+    if args.new is not None:
+        title = args.new.strip()
+        body = f"# {title}\n\n" if title else ""
+        path = create_note(args.notes_dir, body, personal=args.personal)
+        print(path)
+        return 0
+
+    # Neutral by default: an empty dir has no Claude Code memory or CLAUDE.md,
+    # so a sticky note cannot quietly read your personal context.
+    workdir = args.workdir or (Path(
+        os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local/share")
+    ) / "waynote-agent/workdir")
+    workdir.mkdir(parents=True, exist_ok=True)
 
     cmd = args.agent.split()
     streaming = ("stream-json" in " ".join(cmd)) and not args.no_stream
@@ -388,7 +467,7 @@ def main() -> int:
         print(f"notes dir not found: {args.notes_dir}", file=sys.stderr)
         return 1
     print(f"watching {args.notes_dir} "
-          f"({'streaming' if streaming else 'one-shot'}; "
+          f"({'streaming' if streaming else 'one-shot'}; agent cwd {workdir}; "
           f"tag a note `tags: [agent]`, then type `!question`)", flush=True)
 
     if not args.no_seed:
@@ -411,7 +490,7 @@ def main() -> int:
                 continue
             try:
                 if process(path, cmd, args.timeout, args.system_flag,
-                           streaming, args.context_chars):
+                           streaming, args.context_chars, workdir):
                     print(f"answered a trigger in {path.name}", flush=True)
             except Exception as e:  # a bad note must not kill the daemon
                 print(f"error on {path.name}: {e}", file=sys.stderr, flush=True)

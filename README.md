@@ -34,6 +34,33 @@ The trigger is replaced in place, so it can never fire twice:
 
 Untagged notes are ignored entirely.
 
+## Making an agentic note
+
+```sh
+./waynote_agent.py --new "title"          # prints the path
+./waynote_agent.py --new "title" --personal
+```
+
+Bound in Hyprland as Super+Shift+N (plain `waynote new` is Super+N).
+
+## Privacy: personal context is opt-in
+
+Claude Code keys its memory and `CLAUDE.md` by working directory. By default the
+agent runs in an empty scratch dir (`~/.local/share/waynote-agent/workdir`), so
+a sticky note **cannot** read your personal context — a note that asks "name a
+file in my memory directory" gets nothing.
+
+To let one note see it, add to that note's frontmatter:
+
+```
+personal: true
+```
+
+which runs the agent from `$HOME` instead. That's what lets a note answer
+questions about your own machine — useful for a scratchpad, wrong for a
+shopping list, so it's per note rather than global. `--workdir` overrides the
+default location.
+
 ## Threads
 
 The note *is* the conversation. Everything above the trigger is sent as context,
