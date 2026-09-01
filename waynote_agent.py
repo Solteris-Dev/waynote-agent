@@ -51,6 +51,19 @@ STREAM_INTERVAL = 0.35  # seconds between note rewrites while streaming
 SETTLE_SECONDS = 1.5    # ignore a file still being typed into
 POLL_SECONDS = 0.5
 DEFAULT_CONTEXT_CHARS = 6000
+# Pre-approved tools. A non-interactive agent cannot raise a permission prompt,
+# so anything not listed here is simply denied and the note gets "I can't".
+#
+# Everything here is READ-ONLY, and the filesystem tools are additionally bounded
+# by the working directory — which defaults to an empty scratch dir, so a plain
+# note can read nothing of yours. A note with `personal: true` runs from $HOME
+# and these become genuinely useful. That composition is what makes it safe to
+# turn them on by default: the blast radius is set by the workdir, not the tools.
+#
+# Bash, Write and Edit are deliberately absent. Those need an approval path that
+# doesn't exist yet, and defaulting them on would mean a note could act on your
+# machine unattended.
+DEFAULT_ALLOWED_TOOLS = ["WebSearch", "WebFetch", "Read", "Glob", "Grep"]
 
 CONTEXT_TEMPLATE = """\
 You are answering inside a live sticky note on the user's desktop. The note so \
@@ -157,6 +170,61 @@ To ask something unrelated without dragging the thread along, use two bangs:
 """
 
 
+def recover_interrupted(notes_dir: Path) -> list[Path]:
+    """Un-claim questions that were being answered when we died.
+
+    Claiming a trigger rewrites it to a `> **?**` quote before the agent runs, so
+    it can never fire twice. The cost is that a crash, reboot or `systemctl
+    restart` mid-answer strands the note at `_…thinking…_` with no trigger left
+    to retry — stuck forever, silently.
+
+    So on startup, turn any stranded marker back into the question it came from
+    and let the normal path answer it again. A partial streamed reply is
+    discarded: re-asking is cheap, and half an answer presented as whole is
+    worse than none.
+    """
+    recovered = []
+    for path in sorted(notes_dir.glob("*.md")):
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        fm, body = split_frontmatter(text)
+        if not has_agent_tag(fm) or (PENDING not in body and CARET not in body):
+            continue
+
+        lines, out, i = body.splitlines(), [], 0
+        while i < len(lines):
+            if lines[i].startswith("> **?**"):
+                # Collect the quoted question, then look at what follows it.
+                q = [lines[i][len("> **?**"):].strip()]
+                j = i + 1
+                while j < len(lines) and lines[j].startswith("> "):
+                    q.append(lines[j][2:].strip())
+                    j += 1
+                tail = "\n".join(lines[j:])
+                stranded = tail.lstrip().startswith(PENDING) or tail.lstrip().startswith(CARET) \
+                    or (tail.lstrip().split("\n", 1)[0].endswith(CARET) if tail.strip() else False)
+                if stranded:
+                    out.append("!" + q[0])
+                    out.extend(q[1:])
+                    # Drop the stranded marker/partial and stop rewriting here.
+                    rest = [l for l in lines[j:] if PENDING not in l and CARET not in l]
+                    out.extend(rest)
+                    recovered.append(path)
+                    i = len(lines)
+                    continue
+                out.extend(lines[i:j])
+                i = j
+                continue
+            out.append(lines[i])
+            i += 1
+
+        if path in recovered:
+            write_atomic(path, fm + "\n".join(out).rstrip() + "\n")
+    return recovered
+
+
 def create_note(notes_dir: Path, body: str, color: str = "yellow",
                 personal: bool = False) -> Path:
     """Write a new agent-enabled note and return its path."""
@@ -256,13 +324,19 @@ def read_system_prompt(frontmatter: str) -> str | None:
 
 
 def build_argv(cmd: list[str], prompt: str, system: str | None,
-               system_flag: str) -> list[str]:
+               system_flag: str, allowed_tools: list[str]) -> list[str]:
     argv = list(cmd)
     if system:
         if system_flag:
             argv += [system_flag, system]
         else:  # agent has no such flag: fold it into the prompt
             prompt = f"{system}\n\n{prompt}"
+    # --allowedTools is variadic, so the prompt must not follow it directly or it
+    # is swallowed as another tool name. Passing the prompt first avoids that.
+    # Costs nothing: it changes permission decisions, not the cached tool
+    # definitions, so the prompt prefix is byte-identical with or without it.
+    if allowed_tools and "--allowedTools" not in argv:
+        return argv + [prompt, "--allowedTools", *allowed_tools]
     return argv + [prompt]
 
 
@@ -344,7 +418,8 @@ def write_atomic(path: Path, text: str) -> None:
 
 
 def process(path: Path, cmd: list[str], timeout: int, system_flag: str,
-            streaming: bool, context_chars: int, workdir: Path) -> bool:
+            streaming: bool, context_chars: int, workdir: Path,
+            allowed_tools: list[str]) -> bool:
     """Answer the first pending trigger in `path`. True if the file changed."""
     text = path.read_text()
     fm, body = split_frontmatter(text)
@@ -365,7 +440,20 @@ def process(path: Path, cmd: list[str], timeout: int, system_flag: str,
         m = reset or TRIGGER.match(line)
         if not m:
             continue
-        question = m.group(1).strip()
+
+        # A question can run over several lines. Keep consuming until a blank
+        # line, another trigger, or a fence — otherwise only the first line was
+        # ever asked, and the rest of what you typed sat orphaned under the
+        # answer while the agent replied to half a question.
+        question_lines = [m.group(1).strip()]
+        end = i + 1
+        while end < len(lines):
+            nxt = lines[end]
+            if not nxt.strip() or TRIGGER.match(nxt) or nxt.lstrip().startswith("```"):
+                break
+            question_lines.append(nxt.strip())
+            end += 1
+        question = "\n".join(question_lines).strip()
 
         # The note above the trigger *is* the conversation history. Using it
         # directly — rather than a hidden session id — means the context is the
@@ -381,9 +469,10 @@ def process(path: Path, cmd: list[str], timeout: int, system_flag: str,
         prompt = (CONTEXT_TEMPLATE.format(context=context, question=question)
                   if context else question)
 
-        # 1) claim the line immediately so it cannot re-fire, and so the note
-        #    shows a marker while the agent thinks.
-        lines[i : i + 1] = [f"> **?** {question}", "", PENDING]
+        # 1) claim the whole question immediately so it cannot re-fire, and so
+        #    the note shows a marker while the agent thinks.
+        quoted = [f"> **?** {question_lines[0]}"] + [f"> {l}" for l in question_lines[1:]]
+        lines[i:end] = quoted + ["", PENDING]
         write_atomic(path, fm + "\n".join(lines) + "\n")
 
         # `prev` tracks exactly what we last wrote, so each progressive update
@@ -400,7 +489,8 @@ def process(path: Path, cmd: list[str], timeout: int, system_flag: str,
             write_atomic(path, fm_now + body_now.replace(prev, nxt, 1))
             prev = nxt
 
-        argv = build_argv(cmd, prompt, read_system_prompt(fm), system_flag)
+        argv = build_argv(cmd, prompt, read_system_prompt(fm), system_flag,
+                          allowed_tools)
         cwd = Path.home() if wants_personal_context(fm) else workdir
         answer = (ask_streaming(argv, timeout, on_partial, cwd) if streaming
                   else ask_once(argv, timeout, cwd))
@@ -442,6 +532,12 @@ def main() -> int:
                     help="create an agent-enabled note and exit")
     ap.add_argument("--personal", action="store_true",
                     help="with --new: also set `personal: true` on the note")
+    ap.add_argument("--allowed-tools", default=",".join(DEFAULT_ALLOWED_TOOLS),
+                    help="comma-separated tools pre-approved for the agent. A "
+                         "non-interactive agent cannot raise a permission prompt, "
+                         "so anything unlisted is denied outright. Read-only by "
+                         "default and bounded by --workdir; pass '' to deny all "
+                         f"(default: {','.join(DEFAULT_ALLOWED_TOOLS)})")
     ap.add_argument("--no-seed", action="store_true",
                     help="skip the one-time explainer note")
     ap.add_argument("--once", action="store_true", help="one pass, then exit")
@@ -462,6 +558,7 @@ def main() -> int:
     workdir.mkdir(parents=True, exist_ok=True)
 
     cmd = args.agent.split()
+    allowed_tools = [t.strip() for t in args.allowed_tools.split(',') if t.strip()]
     streaming = ("stream-json" in " ".join(cmd)) and not args.no_stream
     if not args.notes_dir.is_dir():
         print(f"notes dir not found: {args.notes_dir}", file=sys.stderr)
@@ -469,6 +566,12 @@ def main() -> int:
     print(f"watching {args.notes_dir} "
           f"({'streaming' if streaming else 'one-shot'}; agent cwd {workdir}; "
           f"tag a note `tags: [agent]`, then type `!question`)", flush=True)
+
+    try:
+        for p in recover_interrupted(args.notes_dir):
+            print(f"recovered an interrupted question in {p.name}", flush=True)
+    except Exception as e:
+        print(f"recovery pass failed: {e}", file=sys.stderr, flush=True)
 
     if not args.no_seed:
         try:
@@ -490,7 +593,7 @@ def main() -> int:
                 continue
             try:
                 if process(path, cmd, args.timeout, args.system_flag,
-                           streaming, args.context_chars, workdir):
+                           streaming, args.context_chars, workdir, allowed_tools):
                     print(f"answered a trigger in {path.name}", flush=True)
             except Exception as e:  # a bad note must not kill the daemon
                 print(f"error on {path.name}: {e}", file=sys.stderr, flush=True)

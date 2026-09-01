@@ -105,6 +105,28 @@ system: you are a terse sysadmin; answer in one line
 Passed via `--append-system-prompt`. For agents without such a flag, use
 `--system-flag ''` and it gets prepended to the prompt instead.
 
+## Tools
+
+The agent can search the web and read files, pre-approved and free:
+
+```
+WebSearch, WebFetch, Read, Glob, Grep
+```
+
+All read-only, and the filesystem ones are bounded by `--workdir` — which
+defaults to an empty scratch dir, so a plain note can read nothing of yours. A
+note with `personal: true` runs from `$HOME` and they become genuinely useful.
+The blast radius is set by the working directory, not the tool list, which is
+what makes turning them on by default safe.
+
+`Bash`, `Write` and `Edit` are deliberately absent: a non-interactive agent
+cannot raise a permission prompt, so granting them would mean a note could act
+on your machine unattended with nothing to say no. `--allowed-tools` overrides
+the set; `--allowed-tools ''` denies everything.
+
+Costs nothing — `--allowedTools` changes permission decisions, not the cached
+tool definitions, so the prompt prefix is byte-identical with or without it.
+
 ## Design notes
 
 - **Stdlib only.** Polls mtimes at 0.5s instead of pulling in a watcher dep.
@@ -127,6 +149,11 @@ Passed via `--append-system-prompt`. For agents without such a flag, use
   note as if the agent had said them. The default agent uses
   `--output-format json` and only the `result` field is used; anything that
   isn't JSON-with-a-result passes through untouched, so plain-text agents work.
+- **Crash recovery.** Claiming a trigger rewrites it before the agent runs, so a
+  crash or restart mid-answer would otherwise strand the note at `…thinking…`
+  with no trigger left to retry. On startup any stranded marker is turned back
+  into its question and re-asked; a partial streamed reply is discarded, since
+  half an answer presented as whole is worse than none.
 - **Atomic writes** via `os.replace`. waynote makes conflict copies rather than
   overwriting, so a simultaneous edit is recoverable either way.
 - Works alongside Obsidian: point waynote's `notes_dir` at a vault folder and
