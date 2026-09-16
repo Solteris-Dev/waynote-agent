@@ -43,6 +43,12 @@ Untagged notes are ignored entirely.
 
 Bound in Hyprland as Super+Shift+N (plain `waynote new` is Super+N).
 
+`--new` only writes a file, so it first checks the session bus for a running
+waynote (`dev.mryll.waynote`) and, if there is none, starts `waynote.service`
+(falling back to launching `waynote` detached). Without that, the note lands
+on disk and nothing renders it — and `waynote new` would have quietly become
+the app instance as a child of whatever key or bar button ran it.
+
 ## Privacy: personal context is opt-in
 
 Claude Code keys its memory and `CLAUDE.md` by working directory. By default the

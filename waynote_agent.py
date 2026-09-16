@@ -64,6 +64,10 @@ DEFAULT_CONTEXT_CHARS = 6000
 # doesn't exist yet, and defaulting them on would mean a note could act on your
 # machine unattended.
 DEFAULT_ALLOWED_TOOLS = ["WebSearch", "WebFetch", "Read", "Glob", "Grep"]
+# waynote's GApplication id on the session bus. `--new` only writes a file, so
+# if no instance is up to render it the note "opens" nowhere. (Contrast
+# `waynote new`, which silently *becomes* the app when none is running.)
+WAYNOTE_BUS_NAME = "dev.mryll.waynote"
 
 CONTEXT_TEMPLATE = """\
 You are answering inside a live sticky note on the user's desktop. The note so \
@@ -223,6 +227,47 @@ def recover_interrupted(notes_dir: Path) -> list[Path]:
         if path in recovered:
             write_atomic(path, fm + "\n".join(out).rstrip() + "\n")
     return recovered
+
+
+def waynote_running() -> bool | None:
+    """Is a waynote instance on the session bus? None if we cannot tell."""
+    try:
+        r = subprocess.run(
+            ["busctl", "--user", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
+             "org.freedesktop.DBus", "NameHasOwner", "s", WAYNOTE_BUS_NAME],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip().endswith("true")
+
+
+def ensure_waynote() -> str | None:
+    """Start waynote if nothing is rendering notes. Returns a message, or None.
+
+    The packaged user unit is preferred so the app is supervised and outlives
+    this one-shot process; a plain detached launch is the fallback. If we
+    cannot tell whether it is running, do nothing rather than spawn a second
+    instance.
+    """
+    if waynote_running() is not False:
+        return None
+    try:
+        r = subprocess.run(["systemctl", "--user", "start", "waynote.service"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return "waynote was not running; started waynote.service"
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        subprocess.Popen(["waynote"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        return "waynote was not running; launched it"
+    except OSError:
+        return ("waynote is not running and could not be started: the note was "
+                "written but nothing will render it until waynote starts")
 
 
 def create_note(notes_dir: Path, body: str, color: str = "yellow",
@@ -546,8 +591,11 @@ def main() -> int:
     if args.new is not None:
         title = args.new.strip()
         body = f"# {title}\n\n" if title else ""
+        started = ensure_waynote()
         path = create_note(args.notes_dir, body, personal=args.personal)
         print(path)
+        if started:
+            print(started, file=sys.stderr)
         return 0
 
     # Neutral by default: an empty dir has no Claude Code memory or CLAUDE.md,
