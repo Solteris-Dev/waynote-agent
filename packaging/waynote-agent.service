@@ -6,7 +6,7 @@ StartLimitIntervalSec=30
 StartLimitBurst=5
 
 [Service]
-ExecStart=%h/Repos/waynote-agent/waynote_agent.py
+ExecStart=%h/Repos/ai-code/waynote-agent/waynote_agent.py
 # `claude` lives in ~/.local/bin, which is not on the default user-unit PATH.
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
